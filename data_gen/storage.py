@@ -13,11 +13,11 @@ from data_gen.episode_generator import Episode
 
 
 def layout_id(layout: dict) -> str:
-    return f"size{layout['size']:.1f}_decor{layout['n_decor']}"
+    return f"grid{layout['grid_size']}_split{layout['split_idx']}_obs{layout['n_obstacles']}"
 
 
 def appearance_id(appearance: dict) -> str:
-    return f"{appearance['wall_tex']}-{appearance['floor_tex']}-{appearance['ceil_tex']}"
+    return f"{appearance['wall_color']}-{appearance['split_color']}-{appearance['door_color']}"
 
 
 def write_episode(episode: Episode, out_dir: Path) -> dict:

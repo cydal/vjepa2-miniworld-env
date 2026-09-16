@@ -1,4 +1,4 @@
-"""Config knobs for the MiniWorld JEPA wrapper.
+"""Config knobs for the MiniGrid JEPA wrapper.
 
 Kept as plain dataclasses (not argparse/hydra) since the whole surface area
 is small enough that a config file would be more machinery than the config.
@@ -8,56 +8,37 @@ from dataclasses import dataclass, field
 
 @dataclass
 class GeometryConfig:
-    """Room size range. OneRoom's own defaults are size=10 (OneRoomS6 uses 6)."""
+    """Grid is a fixed 8x8 for this iteration (keeps the frame a fixed
+    128x128 with no camera randomization, per the brief). Layout diversity
+    instead comes from where the splitting wall/door/key/goal/obstacles
+    land, which varies every episode. Grid-size variation is a deliberate
+    fast-follow, not in this iteration -- see docs/phase1-plan.md.
+    """
 
-    size_min: float = 6.0
-    size_max: float = 14.0
-    # number of decorative (irrelevant) objects scattered in the room
-    n_decor_min: int = 0
-    n_decor_max: int = 3
+    grid_size: int = 8
+    n_obstacles_min: int = 2
+    n_obstacles_max: int = 4
 
 
 @dataclass
 class AppearanceConfig:
-    """Texture *families* to sample from per episode.
-
-    Each name must be a valid prefix under miniworld/textures/ (miniworld
-    itself then randomizes which numbered variant, e.g. wood_1 vs wood_2,
-    within the family we picked -- see env_wrapper/wrapper.py).
+    """MiniGrid's palette is a 6-way categorical, not continuous textures --
+    see core/constants.py COLOR_NAMES. Door/key color must match for the
+    episode to be solvable, so color is functionally load-bearing here, not
+    just decorative.
     """
 
-    wall_textures: tuple = (
-        "wood",
-        "brick_wall",
-        "concrete",
-        "drywall",
-        "stucco",
-        "marble",
-        "cinder_blocks",
-    )
-    floor_textures: tuple = (
-        "floor_tiles_bw",
-        "wood_planks",
-        "concrete",
-        "marble",
-    )
-    ceiling_textures: tuple = (
-        "ceiling_tiles",
-        "ceiling_tile_noborder",
-        "drywall",
-        "concrete_tiles",
-    )
-    # colors for decorative clutter objects; deliberately excludes red so
-    # clutter is never confusable with the red goal box
-    decor_colors: tuple = ("green", "blue", "purple", "yellow", "grey")
+    colors: tuple = ("red", "green", "blue", "purple", "yellow", "grey")
 
 
 @dataclass
 class EpisodeConfig:
-    obs_size: int = 128
+    tile_size: int = 16  # grid_size(8) * tile_size(16) = 128x128 frames
     max_steps: int = 100
-    # probability of repeating the previous action; pure-uniform-random
-    # turn/forward looks jittery, this biases the walk to look purposeful
+    # probability of repeating the previous movement action; pure-uniform
+    # -random turn/forward looks jittery, this biases the walk to look
+    # purposeful. Pickup/toggle are never subject to momentum -- they only
+    # fire reactively (see env_wrapper/policy.py).
     momentum: float = 0.6
 
 

@@ -49,6 +49,54 @@ def contact_sheet(dataset_dir: Path, rows: list, out_path: Path, grid=(5, 5)):
     return len(thumbs)
 
 
+FORWARD_ACTION = 2
+
+
+def dynamics_stats(dataset_dir: Path, rows: list) -> dict:
+    """Counts specific to why this environment replaced the MiniWorld
+    OneRoom pilot (docs/phase1-plan.md): not just texture/appearance
+    variety, but whether the *dynamics* we built this for actually landed
+    in the recorded data across the corpus, not just in a hand-picked demo
+    run."""
+    door_opened = key_picked_up = obstacle_moved = goal_reached = blocked_move = 0
+    total_forward_attempts = 0
+
+    for r in rows:
+        meta = json.load(open(dataset_dir / r["path"] / "meta.json"))
+        steps = meta["steps"]
+
+        if any(s["door_is_open"] for s in steps):
+            door_opened += 1
+        if any(s["carrying"] and s["carrying"]["type"] == "key" for s in steps):
+            key_picked_up += 1
+        if any(
+            steps[i]["obstacle_positions"] != steps[i - 1]["obstacle_positions"]
+            for i in range(1, len(steps))
+        ):
+            obstacle_moved += 1
+        if steps[-1]["agent_position"] == steps[-1]["goal_position"]:
+            goal_reached += 1
+
+        episode_blocked = False
+        for i in range(1, len(steps)):
+            if steps[i]["action"] == FORWARD_ACTION:
+                total_forward_attempts += 1
+                if steps[i]["agent_position"] == steps[i - 1]["agent_position"]:
+                    episode_blocked = True
+        if episode_blocked:
+            blocked_move += 1
+
+    n = len(rows)
+    return {
+        "door_opened": (door_opened, n),
+        "key_picked_up": (key_picked_up, n),
+        "obstacle_moved_independently": (obstacle_moved, n),
+        "goal_reached": (goal_reached, n),
+        "had_a_blocked_move": (blocked_move, n),
+        "total_forward_attempts_sampled": total_forward_attempts,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", type=str, default="dataset/pilot")
@@ -78,7 +126,18 @@ def main():
     print(f"distinct appearance_ids: {n_appearances}")
     print(f"disk usage: {disk_bytes / 1e6:.1f} MB ({disk_bytes / max(n_episodes, 1) / 1e3:.1f} KB/episode)")
     print(f"episode length distribution (top 5): {lengths.most_common(5)}")
-    print(f"action histogram (0=left,1=right,2=fwd), sampled: {dict(action_counts)}")
+    print(
+        "action histogram (0=left,1=right,2=fwd,3=pickup,4=drop,5=toggle), "
+        f"sampled: {dict(action_counts)}"
+    )
+
+    print("\ndynamics check (this is what this iteration was actually for):")
+    for key, value in dynamics_stats(dataset_dir, rows).items():
+        if isinstance(value, tuple):
+            count, n = value
+            print(f"  {key}: {count}/{n} episodes ({100 * count / n:.0f}%)")
+        else:
+            print(f"  {key}: {value}")
 
     out_path = dataset_dir / "contact_sheet.png"
     n_shown = contact_sheet(dataset_dir, rows, out_path)

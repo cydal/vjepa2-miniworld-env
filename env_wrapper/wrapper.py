@@ -1,130 +1,178 @@
-"""Thin wrapper around MiniWorld's OneRoom: randomizes geometry, appearance,
-and clutter per episode, while keeping the camera fixed.
+"""Custom MiniGrid environment purpose-built for dynamics-rich JEPA
+pretraining video: a room split by a wall with a locked door + matching
+key, a goal on the far side, and a handful of independently-moving
+obstacles. See docs/phase1-plan.md for why this replaced the MiniWorld
+OneRoom wrapper (empty room, camera-motion-only, not a meaningful test bed
+for action-conditioned post-training).
 
-Design note: MiniWorld's own `domain_rand=True` flag also randomizes camera
-height/pitch/fov/forward-displacement (see `Agent.randomize` in
-miniworld/entity.py, driven by miniworld/params.py's cam_* entries), which
-we don't want -- the brief is explicit that variation should come from the
-world, not from simultaneously changing the camera. So `_build_params()`
-below takes a copy of MiniWorld's DEFAULT_PARAMS and pins every cam_* /
-motion entry to its default while leaving sky_color / light_* /
-obj_color_bias free to randomize. That gets us real lighting diversity
-(section 7D of the brief) for free instead of writing our own lighting
-code.
+Modeled directly on two of MiniGrid's own reference envs rather than
+invented from scratch:
+- the split-room/door/key/goal layout mirrors `minigrid.envs.doorkey.DoorKeyEnv`
+- the independent obstacle motion is copied from
+  `minigrid.envs.dynamicobstacles.DynamicObstaclesEnv.step` (each obstacle
+  attempts a random reposition in its own 3x3 neighborhood every step, via
+  the same rejection-sampling `place_obj` the base class already uses for
+  initial placement)
+
+Deliberate difference from `DynamicObstaclesEnv`: we do *not* copy its
+obstacle-collision termination. An obstacle blocks the agent's forward
+move exactly like a wall (free, from `WorldObj.can_overlap()` defaulting
+to False) -- a frequent, benign "blocked" transition rather than a rare
+terminal failure, which is the point: MiniGrid's own base `step()` (not
+overridden by us) already makes a blocked-vs-successful move visibly
+distinguishable, we just don't want it to end the episode.
 """
-from gymnasium import spaces, utils
-from miniworld.entity import Ball, Box
-from miniworld.miniworld import MiniWorldEnv
-from miniworld.params import DEFAULT_PARAMS
+import os
+from operator import add
+
+# must be set before minigrid/pygame is imported -- lets rendering work with
+# no real display at all (verified on this box), unlike MiniWorld's pyglet
+# which needed a real GLX connection (Xvfb) even for rgb_array rendering.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+from minigrid.core.grid import Grid
+from minigrid.core.mission import MissionSpace
+from minigrid.core.world_object import Ball, Door, Goal, Key, Wall
+from minigrid.minigrid_env import MiniGridEnv
+from minigrid.wrappers import ImgObsWrapper, RGBImgObsWrapper
 
 from env_wrapper.config import WrapperConfig
 
-_FIXED_PARAM_NAMES = (
-    "forward_step",
-    "forward_drift",
-    "turn_step",
-    "bot_radius",
-    "cam_pitch",
-    "cam_fov_y",
-    "cam_height",
-    "cam_fwd_disp",
-)
+
+def _gen_mission() -> str:
+    return "pick up the key, open the door, get to the goal"
 
 
-def _build_params():
-    params = DEFAULT_PARAMS.copy()
-    pinned = DEFAULT_PARAMS.no_random()
-    for name in _FIXED_PARAM_NAMES:
-        params.params[name] = pinned.params[name]
-    return params
-
-
-class MiniWorldJepaEnv(MiniWorldEnv, utils.EzPickle):
-    """OneRoom-style single room with per-episode geometry + appearance
-    randomization.
-
-    A `MiniWorldEnv` subclass rather than a gymnasium `Wrapper`, because the
-    randomization has to happen inside `_gen_world`, which only has access
-    to `self.np_random` seeded by that episode's `reset(seed=...)` -- there
-    is no post-hoc wrapper hook that fires before world geometry is built.
-    """
-
-    def __init__(self, config: WrapperConfig = None, max_episode_steps=None, **kwargs):
+class MiniGridJepaEnv(MiniGridEnv):
+    def __init__(self, config: WrapperConfig = None, max_steps: int = None, **kwargs):
         self.jepa_config = config or WrapperConfig()
-        max_episode_steps = max_episode_steps or self.jepa_config.episode.max_steps
-        obs_size = self.jepa_config.episode.obs_size
+        size = self.jepa_config.geometry.grid_size
+        max_steps = max_steps or self.jepa_config.episode.max_steps
 
-        # populated by _gen_world, read back by state_metadata()/generators
+        # populated by _gen_grid, read back by state_metadata()/generators
         self.last_layout: dict = {}
         self.last_appearance: dict = {}
+        self.obstacles = []
 
+        mission_space = MissionSpace(mission_func=_gen_mission)
         super().__init__(
-            max_episode_steps=max_episode_steps,
-            obs_width=obs_size,
-            obs_height=obs_size,
-            params=_build_params(),
-            domain_rand=True,
+            mission_space=mission_space,
+            grid_size=size,
+            max_steps=max_steps,
+            see_through_walls=True,
+            highlight=False,  # full, evenly-lit frame -- no partial-observability tint
+            tile_size=self.jepa_config.episode.tile_size,
+            render_mode="rgb_array",
             **kwargs,
         )
-        utils.EzPickle.__init__(
-            self, config=config, max_episode_steps=max_episode_steps, **kwargs
-        )
 
-        # movement-only action space: turn_left, turn_right, move_forward
-        self.action_space = spaces.Discrete(self.actions.move_forward + 1)
+        # left, right, forward, pickup, drop, toggle -- excludes the unused
+        # "done" action (Actions enum order, core/actions.py)
+        self.action_space = type(self.action_space)(self.actions.toggle + 1)
 
-    def _gen_world(self):
+    def _gen_grid(self, width, height):
         geo = self.jepa_config.geometry
-        app = self.jepa_config.appearance
+        colors = self.jepa_config.appearance.colors
         rng = self.np_random
 
-        size = float(rng.uniform(geo.size_min, geo.size_max))
-        wall_tex = str(rng.choice(app.wall_textures))
-        floor_tex = str(rng.choice(app.floor_textures))
-        ceil_tex = str(rng.choice(app.ceiling_textures))
+        wall_color = str(rng.choice(colors))
+        split_color = str(rng.choice(colors))
+        door_color = str(rng.choice(colors))
 
-        self.add_rect_room(
-            min_x=0,
-            max_x=size,
-            min_z=0,
-            max_z=size,
-            wall_tex=wall_tex,
-            floor_tex=floor_tex,
-            ceil_tex=ceil_tex,
-        )
+        self.grid = Grid(width, height)
+        self.grid.horz_wall(0, 0, width, obj_type=lambda: Wall(color=wall_color))
+        self.grid.horz_wall(0, height - 1, width, obj_type=lambda: Wall(color=wall_color))
+        self.grid.vert_wall(0, 0, height, obj_type=lambda: Wall(color=wall_color))
+        self.grid.vert_wall(width - 1, 0, height, obj_type=lambda: Wall(color=wall_color))
 
-        # the goal: a red box, visible but never given to the model as a label
-        self.box = self.place_entity(Box(color="red"))
+        split_idx = int(rng.integers(2, width - 2))
+        self.grid.vert_wall(split_idx, 0, obj_type=lambda: Wall(color=split_color))
 
-        # irrelevant clutter for object diversity (section 7E); never red,
-        # so it can't be confused with the goal by anyone inspecting frames
-        n_decor = int(rng.integers(geo.n_decor_min, geo.n_decor_max + 1))
-        self.decor = []
-        for _ in range(n_decor):
-            color = str(rng.choice(app.decor_colors))
-            self.decor.append(self.place_entity(Ball(color=color)))
+        self.goal_pos = (width - 2, height - 2)
+        self.put_obj(Goal(), *self.goal_pos)
 
-        self.place_agent()
+        self.place_agent(size=(split_idx, height))
 
-        self.last_layout = {"size": round(size, 3), "n_decor": n_decor}
+        door_idx = int(rng.integers(1, height - 1))
+        self.door = Door(door_color, is_locked=True)
+        self.put_obj(self.door, split_idx, door_idx)
+
+        self.key = Key(door_color)
+        self.place_obj(self.key, top=(0, 0), size=(split_idx, height))
+
+        n_obstacles = int(rng.integers(geo.n_obstacles_min, geo.n_obstacles_max + 1))
+        self.obstacles = []
+        obstacle_colors = []
+        for _ in range(n_obstacles):
+            color = str(rng.choice(colors))
+            obstacle_colors.append(color)
+            obstacle = Ball(color=color)
+            self.obstacles.append(obstacle)
+            self.place_obj(obstacle, max_tries=100)
+
+        self.mission = _gen_mission()
+
+        self.last_layout = {
+            "grid_size": width,
+            "split_idx": split_idx,
+            "door_idx": door_idx,
+            "n_obstacles": n_obstacles,
+        }
         self.last_appearance = {
-            "wall_tex": wall_tex,
-            "floor_tex": floor_tex,
-            "ceil_tex": ceil_tex,
+            "wall_color": wall_color,
+            "split_color": split_color,
+            "door_color": door_color,
+            "obstacle_colors": obstacle_colors,
         }
 
     def step(self, action):
-        obs, reward, termination, truncation, info = super().step(action)
-        if self.near(self.box):
-            reward += self._reward()
-            termination = True
-        return obs, reward, termination, truncation, info
+        # Move obstacles first, independent of the agent's action -- see
+        # module docstring. Copied from DynamicObstaclesEnv.step (without
+        # its collision-termination block).
+        for obstacle in self.obstacles:
+            old_pos = obstacle.cur_pos
+            top = tuple(map(add, old_pos, (-1, -1)))
+            try:
+                self.place_obj(obstacle, top=top, size=(3, 3), max_tries=100)
+                self.grid.set(old_pos[0], old_pos[1], None)
+            except Exception:
+                pass
+
+        return super().step(action)
 
     def state_metadata(self) -> dict:
-        """Everything the brief wants recorded as metadata (section 9),
-        kept out of the observation actually handed to the model."""
+        """Everything the brief wants recorded as metadata, kept out of the
+        observation actually handed to the model. Includes door/obstacle
+        state specifically so the verification step (docs/phase1-plan.md)
+        can check that door-open and obstacle-move events actually land in
+        the recorded data, not just in theory."""
+        carrying = None
+        if self.carrying is not None:
+            carrying = {"type": self.carrying.type, "color": self.carrying.color}
         return {
-            "agent_position": [float(v) for v in self.agent.pos],
-            "agent_orientation": float(self.agent.dir),
-            "goal_position": [float(v) for v in self.box.pos],
+            "agent_position": [int(v) for v in self.agent_pos],
+            "agent_orientation": int(self.agent_dir),
+            "carrying": carrying,
+            "door_is_open": bool(self.door.is_open),
+            "door_is_locked": bool(self.door.is_locked),
+            "goal_position": [int(v) for v in self.goal_pos],
+            "obstacle_positions": [
+                [int(v) for v in ob.cur_pos] for ob in self.obstacles
+            ],
         }
+
+
+def make_env(config: WrapperConfig = None):
+    """`MiniGridJepaEnv` wrapped so `reset()`/`step()` return a bare full
+    top-down RGB frame as `obs` (not MiniGrid's default symbolic partial
+    Dict observation) -- matches the contract data_gen/episode_generator.py
+    expects (mirrors how MiniWorldEnv returned the render directly).
+    `last_layout`/`last_appearance`/`state_metadata()`/`jepa_config` all
+    remain reachable on the wrapped object via gymnasium's attribute
+    delegation to the inner env.
+    """
+    config = config or WrapperConfig()
+    env = MiniGridJepaEnv(config=config)
+    env = RGBImgObsWrapper(env, tile_size=config.episode.tile_size)
+    env = ImgObsWrapper(env)
+    return env

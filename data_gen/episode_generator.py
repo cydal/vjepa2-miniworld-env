@@ -7,7 +7,6 @@ from typing import List
 import numpy as np
 
 from env_wrapper.policy import MomentumRandomPolicy
-from env_wrapper.wrapper import MiniWorldJepaEnv
 
 
 @dataclass
@@ -20,30 +19,34 @@ class Episode:
     steps: List[dict] = field(default_factory=list)  # per-timestep metadata
 
 
-def generate_episode(
-    env: MiniWorldJepaEnv, episode_id: str, seed: int, momentum: float
-) -> Episode:
+def generate_episode(env, episode_id: str, seed: int, momentum: float) -> Episode:
+    """`env` is whatever `env_wrapper.wrapper.make_env()` returns -- a
+    gymnasium-wrapped env whose reset()/step() yield a bare RGB frame as
+    `obs`. Gymnasium wrappers don't forward arbitrary attribute access, so
+    `last_layout`/`last_appearance`/`state_metadata()`/`jepa_config` are
+    read off `env.unwrapped` (the raw MiniGridJepaEnv) explicitly."""
+    raw = env.unwrapped
     obs, _ = env.reset(seed=seed)
     rng = np.random.default_rng(seed)
     policy = MomentumRandomPolicy(momentum=momentum, rng=rng)
 
     frames = [obs]
-    steps = [{"timestep": 0, "action": None, **env.state_metadata()}]
+    steps = [{"timestep": 0, "action": None, **raw.state_metadata()}]
 
-    max_steps = env.jepa_config.episode.max_steps
+    max_steps = raw.jepa_config.episode.max_steps
     for t in range(1, max_steps + 1):
-        action = policy.act()
+        action = policy.act(env)
         obs, reward, terminated, truncated, info = env.step(action)
         frames.append(obs)
-        steps.append({"timestep": t, "action": int(action), **env.state_metadata()})
+        steps.append({"timestep": t, "action": int(action), **raw.state_metadata()})
         if terminated or truncated:
             break
 
     return Episode(
         episode_id=episode_id,
-        environment_id="oneroom",
-        layout=dict(env.last_layout),
-        appearance=dict(env.last_appearance),
+        environment_id="minigrid_doorkey_dynobs",
+        layout=dict(raw.last_layout),
+        appearance=dict(raw.last_appearance),
         frames=np.stack(frames, axis=0),
         steps=steps,
     )

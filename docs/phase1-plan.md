@@ -1,87 +1,55 @@
-# MiniWorld → JEPA Phase 1: environment wrapper + pilot video corpus
+# MiniWorld → MiniGrid pivot: a dynamics-rich custom environment (Phase 1, take 2)
 
 ## Context
 
-You want to deliberately split this into two phases and commit only to Phase 1 right now: build a MiniWorld-based environment wrapper, generate a **pilot** corpus of short unlabeled videos, and verify the generation pipeline (diversity, storage, timing) *before* deciding whether to scale to 10k+ clips or start writing the JEPA model itself. That staging (pilot → inspect → scale only if the pipeline earns it) is explicit in your own brief, so this plan stops at "pilot generated and inspected," not at "JEPA model trained."
+The MiniWorld/OneRoom pilot shipped previously (500 episodes, verified, committed) turned out to be the wrong substrate: it's an empty room where the only thing that ever changes is the camera's own pose. That's not a meaningful test bed for JEPA-style pretraining, and it's specifically weak for what this is actually building toward: action-conditioned post-training (V-JEPA-2-AC style), where the whole point is that identical visual context plus a different action should produce a different, learnable future. Camera-pan optic flow doesn't exercise that; an agent's action needs to visibly change the *state of the world*, not just its own viewpoint.
 
-This is a new, from-scratch project — nothing MiniWorld/JEPA-related exists on disk yet. It's not part of the `ai-build-and-learn` public stream repo (that repo's `topics/v-jepa` is a *different*, already-shipped project: probing a **pretrained** V-JEPA 2 checkpoint on Kinetics clips via Flyte/DGX-Spark. This project trains a **small JEPA-style model from scratch** on **procedurally generated** MiniWorld video — different goal, different infra). It fits the pattern of `car_dreamer/dreamer-car-nav`: a personal project living as a sibling directory under `/home/ubuntu/world_models/`, own conda env, own `notes/` journal.
+Clarifying-question answers that shape this plan:
+- Dynamics that matter: **independent world dynamics** (things change without the agent acting) and **collision/blocked motion** (an action's effect is state-dependent — sometimes it works, sometimes it's blocked).
+- Engine: open to swapping away from MiniWorld if it serves the dynamics better.
+- This is explicitly feeding **action-conditioned post-training** — "sensible transitions" means actions with distinguishable, non-trivial consequences.
+- Scope: build one concrete next iteration now, not a broader survey.
 
-Two environment facts constrain the design:
-- **No GPU is currently attached to this box** (`nvidia-smi` fails; only Amazon's virtual VGA device shows in `lspci`). Irrelevant for Phase 1 (MiniWorld rendering is cheap, CPU-only is fine) but means model training later will need either a GPU to show up or a CPU-friendly toy model.
-- **Disk is at 92% (11 GB free)**. The pilot budget and storage format need to respect that headroom explicitly, not just "add videos and see."
+Investigated MiniWorld's actual engine capabilities first (not guessed): confirmed it never calls a per-step update on non-agent entities at all (`Entity.step()` is defined but nothing invokes it), and its `toggle` action is declared in the `Actions` enum but has no handler anywhere in `MiniWorldEnv.step()` — dead code. Getting independent dynamics or working doors out of MiniWorld means writing new engine-level simulation code, not configuring existing code.
 
-## Where it lives
+Verified an alternative, **MiniGrid** (Farama Foundation's sibling project, 2D top-down grid world), directly on this box:
+- Installs cleanly, renders headless via `SDL_VIDEODRIVER=dummy` — no Xvfb, no `libglu1-mesa`, none of the GL pain MiniWorld needed.
+- `MiniGrid-Dynamic-Obstacles-8x8-v0`: obstacles visibly relocate every step even when the agent's action never moves it (confirmed by rendering 7 frames with the agent only turning — obstacles moved, agent didn't).
+- `MiniGrid-DoorKey-8x8-v0`: a **real** functioning door/key mechanic — `Door.toggle()` actually checks `env.carrying` against the door's color and only unlocks on a match; MiniWorld's equivalent action is a no-op.
 
-New sibling directory: `/home/ubuntu/world_models/miniworld-jepa/`
-New dedicated conda env: `miniworld` (python 3.11, matching the "one env per project" house convention — `t3d` and `dreamer` stay untouched).
+Decision: replace the MiniWorld-based environment with a custom MiniGrid environment purpose-built to contain both requested dynamics classes at once.
 
-```
-miniworld-jepa/
-  env_wrapper/
-    __init__.py
-    config.py         # dataclasses: GeometryConfig, AppearanceConfig, EpisodeConfig
-    wrapper.py         # MiniWorldJepaEnv: subclasses/wraps miniworld.envs.OneRoom
-    appearance.py       # texture/color/lighting randomization presets
-    policy.py           # random-walk-with-momentum action policy (pure uniform-random
-                         # turn/forward looks too jittery for "natural" trajectories)
-  data_gen/
-    episode_generator.py  # one episode = randomize → reset → roll out policy → record
-    clip_extractor.py      # overlapping fixed-length clips from one long episode
-    storage.py             # write frames (mp4 via imageio-ffmpeg) + metadata (jsonl)
-  scripts/
-    smoke_test.py          # launch OneRoom headless, step, save one PNG — proves
-                            # Xvfb + pyglet + mesa softpipe actually renders on this box
-    generate_pilot.py       # CLI: N episodes, writes dataset/pilot/
-    inspect_dataset.py      # sample grid across appearance/layout combos, print
-                            # disk usage + timing, basic diversity sanity checks
-  dataset/                 # gitignored — pilot/ output lives here
-  notes/                    # gitignored: journal.md + concepts/*.md, same convention
-                            # as dreamer-car-nav
-  docs/
-    phase1-plan.md          # versioned copy of the agreed spec
-  requirements.txt
-  README.md
-  .gitignore
-```
+## Design: `MiniGridJepaEnv`
 
-No Flyte. The v-jepa topic's Flyte pipeline is real infra (custom container images, a local registry, an arm64/DGX-Spark-pinned setup) that doesn't exist on this box and would be pure overhead for a local data-gen script — plain Python matches what `dreamer-car-nav` already does successfully.
+One room split by an internal wall with a locked door (random color) + matching key (same color) placed somewhere in the near side, a goal tile in the far side, and a handful of dynamic obstacles (`Ball` entities) scattered through the room.
 
-## Headless rendering
+- **Actions**: `Discrete(6)` = `left, right, forward, pickup, drop, toggle` (`core/actions.py` enum; excludes the unused `done` action). Needing `pickup`/`toggle` for the door/key mechanic is *why* the action set is richer than MiniWorld's movement-only 3.
+- **Per-episode randomization**: happens inside `_gen_grid(width, height)`, which `reset()` calls *after* seeding `self.np_random` (`minigrid_env.py:119-157`), so the existing `self._rand_color()` / `self._rand_int()` / `place_obj()` rejection-sampling helpers give us per-episode-seeded placement, same pattern as MiniWorld's `_gen_world`. Randomize: wall-split position, door/key color (matched), goal position, obstacle count and starting positions.
+- **Independent dynamics**: copy the obstacle-relocation loop from `DynamicObstaclesEnv.step()` (`dynamicobstacles.py:136-156`, each obstacle attempts a random reposition in its 3x3 neighborhood via `place_obj`) into our own `step()` override, run *before* calling `super().step(action)`. This is the exact mechanism already proven to work — obstacles move regardless of what the agent does.
+- **Collision semantics — deliberately different from stock `DynamicObstaclesEnv`**: do **not** copy its obstacle-collision termination (`dynamicobstacles.py:161-165`, which ends the episode on agent/obstacle collision). Here, walking into an obstacle (or the locked door, or the wall) just blocks the move like any wall — a benign, frequent, clearly-labeled "blocked" transition rather than a rare failure event. This is what actually gives us the "collision & blocked motion" dynamics class as common, learnable data rather than an edge case.
+- **Rendering**: full top-down frame, not the agent-egocentric partial view — `render_mode="rgb_array"` / `get_frame(agent_pov=False, tile_size=...)` (`minigrid_env.py:668-785`). Fixed grid size **8x8 with `tile_size=16` → exactly 128x128px**, no camera randomization, consistent with the original brief's "vary the world, not the camera." Grid-size variation is a plausible fast-follow, not in this iteration — layout diversity for now comes from wall-split position, door/key/goal/obstacle placement, and obstacle count, which is already substantial.
+- **Appearance randomization**: MiniGrid's palette is a 6-way categorical (`red, green, blue, purple, yellow, grey`), not MiniWorld's continuous textures — coarser, but door/key color *must* match for the episode to be solvable, so color is functionally load-bearing here, not just decorative. That's arguably a better property for later representation probing than MiniWorld's purely-cosmetic texture swaps.
 
-MiniWorld renders through Pyglet/OpenGL (unlike `dreamer-car-nav`'s pure-Pillow rendering, which needs no display at all) — it needs a real GL context even for `render_mode="rgb_array"`. Confirmed on this box: `libGLX_mesa`/`libGL.so.1` are present, and `Xvfb`/`xvfb-run` are installed, so Mesa's software rasterizer (llvmpipe) can back a virtual framebuffer with no GPU. The existing `T3D-car-navigation/start_display.sh` Xvfb+fluxbox+VNC stack is for **live GUI viewing** and is more than this needs. For batch corpus generation, just wrap each script:
+## Action policy: momentum-random + reactive pickup/toggle
 
-```bash
-xvfb-run -a .../envs/miniworld/bin/python scripts/generate_pilot.py ...
-```
+Pure momentum-random movement (the existing `MomentumRandomPolicy`) would almost never wander onto the key at the right moment, or reach the door while carrying it — the corpus would rarely contain the door-opens transition that's the actual point of building this. Extend the policy: when the cell directly ahead is the key and the agent isn't carrying anything, force `pickup`; when the cell ahead is a locked door and the agent is carrying the matching key, force `toggle`; otherwise fall back to the existing momentum-biased random walk over `{left, right, forward}`. Still fully scripted/reactive, not RL — consistent with the original brief's "actions only generate trajectories, no learning involved."
 
-`smoke_test.py` is step one specifically to prove this combination actually renders a frame on this box before anything else is built on top of it — if it doesn't, everything downstream stalls, so it's worth confirming first rather than assuming.
+## What's reused unchanged
 
-## Environment choice and wrapper design
+`data_gen/episode_generator.py`, `data_gen/clip_extractor.py`, `data_gen/storage.py`, `scripts/generate_pilot.py`, `scripts/inspect_dataset.py` only depend on a small contract: `env.reset(seed=)`, `env.step(action)`, `env.last_layout`, `env.last_appearance`, `env.state_metadata()`, `env.jepa_config.episode.max_steps`. `MiniGridJepaEnv` keeps that exact contract, so these files need no changes. mp4 storage via `imageio` is unaffected — frames are still plain uint8 arrays, just from a different renderer.
 
-Start from MiniWorld's built-in `OneRoom` (`miniworld.envs.oneroom.OneRoom`), not a from-scratch env — it already has a rectangular room, a configurable `size`, and a red-box goal object baked into the default task, which covers most of section 3's "Geometry" and "Goal" requirements for free. The wrapper's actual new work is:
+## What changes
 
-- **Appearance randomization** — MiniWorld rooms take per-surface textures (`wall_tex`, `floor_tex`, `ceil_tex`) and its bundled texture set (`miniworld/textures/`) has enough materials (wood, brick, concrete, carpet, grass, etc.) for real "same room, different look" pairs; colors/lighting come from `Room`/`MiniWorldEnv` params. Exact override points (`_gen_world`, `Room` constructor kwargs) get confirmed by reading the installed package source in step 1 of implementation, not guessed now.
-- **Agent start pose + goal placement randomization** — expose explicit control over `place_agent`/`place_entity` calls with a seeded RNG so we can log the exact configuration used (needed for the metadata in section 9).
-- **Action policy** — pure-uniform-random `{turn_left, turn_right, move_forward}` produces visually jittery, non-purposeful trajectories. Use a simple momentum-biased random walk (weight toward repeating the previous action) so trajectories look like plausible short walks rather than noise — still fully unsupervised/no RL involved.
-- **Metadata capture** — `env.agent.pos`, `env.agent.dir`, and the goal entity's position are read directly off the MiniWorld env each step; no simulator modification needed, matching the "wrapper, don't fork" instruction.
-
-## Data generation pipeline
-
-- One **episode** = randomize geometry config + appearance config + start/goal → roll out the momentum-biased policy for ~100+ steps → record every frame (128×128 RGB, fixed camera, per section 5) + per-step metadata (`episode_id, environment_id, layout_id, appearance_id, timestep, agent_position, agent_orientation, goal_position, action`).
-- **Clips** are extracted from each episode as overlapping fixed-length windows (default 32 frames, configurable, per section 6) — this is a pure array-slicing step in `clip_extractor.py`, not a second simulator pass.
-- **Storage**: each episode's frames as one small mp4 (via `imageio`/`imageio-ffmpeg`, already need pyav-free ffmpeg on this box or fall back to imageio's ffmpeg plugin) plus one `.jsonl` metadata sidecar. mp4 keeps the pilot small under the 11 GB constraint versus raw PNG-per-frame dumps.
-- **Splits** are by `layout_id`/`appearance_id`, not by frame or clip (section 11) — implemented as a manifest step (a CSV/JSON index of which episode belongs to train/val/test-structural/test-appearance), never by physically separating files.
-
-## Pilot run + inspection (the actual deliverable of this plan)
-
-- `generate_pilot.py --n-episodes 500 --episode-len 100` → writes `dataset/pilot/`, printing running disk usage so we stop early if projections blow past the 11 GB headroom.
-- `inspect_dataset.py` → renders a contact-sheet grid sampling across different appearance/layout combinations (the "same world, different appearance" check from section 8), reports total disk size, total generation wall-time, frame count, and a couple of trivial sanity numbers (e.g. distribution of episode lengths, action histogram) — enough to make the "verify generation / inspect diversity / estimate storage & time" pilot checklist from your brief concrete and checkable, without building any probes or model code yet.
-
-Explicitly out of scope for this plan (per your own staging — "scale when the experiment tells us to," and Phase 1's model work is a separate step): the 10k–20k clip corpus, dataset-split-family holdouts for appearance generalization, the JEPA model itself, and any probes/evaluation. Those are the next increment, after this pilot is generated and actually looked at.
+- `env_wrapper/config.py` — swap MiniWorld texture-family lists for MiniGrid's 6-color palette; geometry config becomes obstacle-count range (grid-size range deferred).
+- `env_wrapper/wrapper.py` — new `MiniGridJepaEnv(MiniGridEnv)` replacing the MiniWorld-based class, per the design above.
+- `env_wrapper/policy.py` — extend `MomentumRandomPolicy` with the reactive pickup/toggle rule; it now needs to inspect the cell ahead of the agent each `act()` call, so it takes the env (not just an RNG) as an argument.
+- `requirements.txt` / `README.md` — swap `miniworld`/`pyglet` for `minigrid`; drop the Xvfb/`libglu1-mesa` setup instructions (not needed — verified headless via `SDL_VIDEODRIVER=dummy`).
+- `scripts/smoke_test.py` — updated for the new env and action set.
+- Pilot data: move the existing MiniWorld pilot to `dataset/_archive_miniworld_pilot_v1/` (kept for the journal's before/after comparison; still gitignored) and generate a fresh 500-episode MiniGrid pilot at `dataset/pilot/`.
+- `notes/journal.md` — record why the pivot happened and what changed, per the standing convention.
 
 ## Verification
 
-1. `xvfb-run -a .../envs/miniworld/bin/python scripts/smoke_test.py` renders and saves one non-blank PNG from `OneRoom` — proves the headless GL path works on this box.
-2. `generate_pilot.py --n-episodes 20` (small smoke run) completes, produces the expected file layout, and metadata round-trips (positions/orientations change sensibly frame to frame, actions match the policy's action space).
-3. Full 500-episode pilot run completes within a sane wall-clock time and disk budget (both printed by the script).
-4. `inspect_dataset.py`'s contact sheet visibly shows appearance variety (different textures/colors) across otherwise-similar layouts, confirming the "same state, different pixels" property the brief cares about — this is a manual look at the output, not an automated assertion.
+1. Updated `smoke_test.py`: reset, confirm the frame is exactly 128x128 and non-blank, run a scripted rollout, confirm the reactive policy actually issues `pickup`/`toggle` at the right moments in at least one short run, save sample frames.
+2. Small dry run (`generate_pilot.py --n-episodes 20`): manually inspect a few `meta.json` step sequences to confirm obstacle positions change between consecutive steps even when the agent's own action was e.g. `left` (proves independent dynamics landed in the actual data, not just in theory), and that at least some episodes show `carrying → key` followed by the door's `is_open` flipping to `True`.
+3. Full 500-episode pilot regenerated; rerun `inspect_dataset.py`. Contact sheet should now show colored doors/keys/obstacles, not empty rooms. Add two counts specific to this iteration's goal: how many episodes exercised a door-open event, and how many had at least one obstacle- or door-blocked move — a concrete diversity check tied to what we were actually trying to fix, not just texture/appearance variety.

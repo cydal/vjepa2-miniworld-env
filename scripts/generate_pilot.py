@@ -2,8 +2,8 @@
 manifest.jsonl indexing them by layout_id/appearance_id for later splitting
 (section 11 -- splits are by config, never by frame).
 
-Run with:
-    xvfb-run -a <conda env>/bin/python scripts/generate_pilot.py --n-episodes 500
+Run with (no Xvfb needed -- headless via SDL_VIDEODRIVER=dummy):
+    <conda env>/bin/python scripts/generate_pilot.py --n-episodes 500
 """
 import argparse
 import json
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data_gen.episode_generator import generate_episode
 from data_gen.storage import write_episode
 from env_wrapper.config import WrapperConfig
-from env_wrapper.wrapper import MiniWorldJepaEnv
+from env_wrapper.wrapper import make_env
 
 
 def disk_free_gb(path: Path) -> float:
@@ -38,7 +38,7 @@ def main():
 
     config = WrapperConfig()
     config.episode.max_steps = args.episode_len
-    env = MiniWorldJepaEnv(config=config, render_mode="rgb_array")
+    env = make_env(config)
 
     manifest_path = out_dir / "manifest.jsonl"
     t_start = time.time()

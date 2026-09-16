@@ -1,3 +1,3 @@
-from env_wrapper.wrapper import MiniWorldJepaEnv
+from env_wrapper.wrapper import MiniGridJepaEnv, make_env
 
-__all__ = ["MiniWorldJepaEnv"]
+__all__ = ["MiniGridJepaEnv", "make_env"]
