@@ -66,8 +66,27 @@ goal actually reached within the 100-step budget in 54%. Contact sheet at
 `inspect_dataset.py`). Details in [notes/journal.md](notes/journal.md)
 (gitignored, ask if you want the contents).
 
+## Phase 2 pilot-scale run (2026-09-16)
+
+First model: a small plain V-JEPA-style encoder/predictor (no action
+conditioning yet -- see [docs/phase2-plan.md](docs/phase2-plan.md)),
+trained on this GPU box on the regenerated 500-episode pilot (3570 train /
+419 val clips, 16-frame clips, 2.67M-param ViT encoder). Masked-prediction
+loss trains cleanly and doesn't collapse (embedding std keeps growing, not
+shrinking), but the linear probe this plan set as the actual bar -- does
+the trained encoder beat a random-init encoder of the same shape at
+predicting the agent's grid position from a frozen, mean-pooled embedding
+-- **was not met**: trained MSE 2.30 vs. random-init 0.65 on the best
+checkpoint (was 26.66 vs. 1.33 before fixing an overly aggressive learning
+rate). Full numbers and the leading hypotheses (undetermined which
+dominates: scale, mean-pooling diluting local signal, or the objective
+favoring scene appearance over agent state) are in
+[docs/phase2-plan.md](docs/phase2-plan.md)'s Results section.
+
 ## Next
 
-Not yet done, deliberately: scaling to a larger clip corpus, appearance/
-structural holdout splits, the JEPA model itself, and any probes. Those
-follow once this pilot has actually been used for something.
+Not yet decided: whether to scale up data generation now anyway, first
+retry the probe itself (e.g. attend to the agent-local token instead of
+mean-pooling, or probe from an intermediate layer), or run longer/bigger
+before concluding. Appearance/structural holdout splits and action
+conditioning (V-JEPA-2-AC) remain deliberately deferred past this.

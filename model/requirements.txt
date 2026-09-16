@@ -1,0 +1,6 @@
+torch==2.13.0
+numpy==2.4.6
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+einops==0.8.1
+tqdm==4.67.1
