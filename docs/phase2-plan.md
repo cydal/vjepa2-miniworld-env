@@ -190,3 +190,71 @@ not just a red herring, even though this run alone still doesn't clear the
 bar this plan set. Doesn't yet distinguish between "needs more data" and
 "needs more training/bigger model at this data size" as the dominant
 lever -- both remain plausible.
+
+## Root-caused and fixed the training-drift pattern (2026-09-16)
+
+User pushed back on the recurring "drops, then drifts worse, then
+partially recovers as lr decays" loss pattern -- correctly: that's not
+what healthy training looks like, and it showed up identically at 500,
+5,000, and 10,000 episodes and at two different peak lrs, so it was never
+going to be fixed by more data or more lr tuning. Root-caused it properly
+instead of continuing to scale blindly.
+
+**Comparison against the actual V-JEPA2 recipe** surfaced two real
+simplifications in this implementation: mask ratio was 60% (V-JEPA masks
+~90%, leaving very little visible context -- an easier, less informative
+task at 60%) and the EMA target used a **fixed** momentum (0.998) instead
+of V-JEPA's momentum **schedule** (ramping e.g. 0.996 -> 1.0 over
+training). The fixed-momentum gap was the leading suspect for the drift
+itself, since target_std grew monotonically in every run regardless of
+scale or lr.
+
+**That hypothesis was wrong**, and the ablation that disproved it is worth
+recording because chasing it further would have wasted real time:
+1. Set `--ema-momentum-start 1.0 --ema-momentum-end 1.0` (target encoder
+   provably frozen -- verified per-step, bit-for-bit, that
+   `target_encoder`'s parameters never move under this setting).
+2. `target_std` **still grew** (0.34 -> ~0.50 over a few epochs) even
+   though the target encoder's own weights were frozen the entire time.
+3. Traced it to `patch_embed` (the trainable Conv3d tubelet projection,
+   shared by both the context and target paths): its raw output std grew
+   from 0.27 -> 1.10 over the first ~40 steps and plateaued. Nothing
+   constrained its output scale, so the *input* to the frozen target
+   encoder was non-stationary -- that alone fully explains a frozen
+   encoder's output std growing, no EMA instability required.
+4. Fix: added `self.patch_norm = nn.LayerNorm(cfg.encoder_dim)` applied to
+   `patch_embed`'s output before adding the positional embedding
+   (`model/jepa.py`, `JEPA.__init__`/`forward`). Re-ran the same frozen-
+   target ablation: `raw_tokens.std()` now stays pinned at ~1.0 instead of
+   climbing to 1.1, and `target_std` settles into a bounded 0.27-0.36
+   range instead of climbing unboundedly.
+5. Re-ran real (non-frozen) training with the fix + the mask-ratio-0.9 and
+   momentum-schedule changes together (10 epochs, pilot data, lr=1e-4):
+   val_loss now decreases **every single epoch** (0.309 -> 0.162 -> 0.110
+   -> 0.096 -> 0.087 -> 0.082 -> 0.079 -> 0.078 -> 0.077 -> 0.077) --
+   exactly the "several drops before flattening" shape expected of healthy
+   training, and the complete opposite of every prior run's drift pattern.
+
+**A process note, since it nearly produced a wrong conclusion**: the
+*first* attempt at this frozen-target ablation was run while a previous
+`scale10k` training job was still finishing in the background on the same
+box. That job crashed with `DataLoader worker...killed by signal: Killed`
+(this box has only 15GB RAM, no swap -- two concurrent training jobs' worth
+of persistent DataLoader workers exceeded it), and the concurrent ablation
+run showed target-encoder norm-weight values jumping around even though a
+truly frozen target should be bit-identical across every step. Re-running
+the exact same ablation alone (no concurrent job) still showed the jump,
+which briefly looked like a real non-determinism bug -- until per-step
+instrumentation (`.clone()` + explicit sync each step) made it disappear
+entirely across multiple clean reruns. That inconsistency was itself the
+clue: it wasn't a per-step accounting bug, it was real, gradual growth in
+`patch_embed`'s output landing on the actual mechanism once measured
+directly (see point 3 above) rather than inferred from noisy end-of-epoch
+parameter snapshots. Lesson: don't run two GPU/RAM-heavy jobs on this box
+at once, and when a diagnostic reading looks paradoxical, measure the
+actual quantity in question directly rather than trusting a proxy.
+
+Not yet done: rerunning the probe (agent-position linear regression) with
+this fixed model at the 5,000/10,000-episode scale already generated, to
+see whether the healthier training dynamics also finally clear the
+probe-vs-random-init bar that no run had cleared before this fix.

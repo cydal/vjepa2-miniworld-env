@@ -28,8 +28,11 @@ class JepaConfig:
     predictor_depth: int = 4
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
-    mask_ratio: float = 0.6
-    ema_momentum: float = 0.998
+    mask_ratio: float = 0.9
+    # EMA momentum ramps start -> end over training (V-JEPA-style schedule)
+    # rather than staying fixed -- see update_target_encoder().
+    ema_momentum_start: float = 0.996
+    ema_momentum_end: float = 1.0
 
     @property
     def grid_size(self) -> int:
@@ -243,6 +246,12 @@ class JEPA(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.patch_embed = PatchEmbed3D(cfg, cfg.encoder_dim)
+        # Nothing otherwise constrains patch_embed's output scale, and it's
+        # shared between the context and target paths -- confirmed by
+        # ablation (target_encoder weights frozen, target_std still grew
+        # because its *input* was growing) that this, not EMA instability,
+        # was driving the unbounded target_std growth. See docs/phase2-plan.md.
+        self.patch_norm = nn.LayerNorm(cfg.encoder_dim)
         self.context_encoder = ViTEncoder(
             cfg.encoder_dim, cfg.encoder_depth, cfg.encoder_heads, cfg.mlp_ratio
         )
@@ -255,8 +264,11 @@ class JEPA(nn.Module):
         self.masker = MultiBlockMask(cfg)
 
     @torch.no_grad()
-    def update_target_encoder(self):
-        m = self.cfg.ema_momentum
+    def update_target_encoder(self, momentum: float = None):
+        """momentum defaults to cfg.ema_momentum_start for callers (e.g.
+        smoke_test.py) that don't run a schedule; train.py passes the
+        scheduled value explicitly each step (see ema_momentum_schedule)."""
+        m = self.cfg.ema_momentum_start if momentum is None else momentum
         for tp, cp in zip(self.target_encoder.parameters(), self.context_encoder.parameters()):
             tp.mul_(m).add_(cp, alpha=1 - m)
 
@@ -272,7 +284,7 @@ class JEPA(nn.Module):
     def forward(self, clip: torch.Tensor):
         """clip: (B, T, C, H, W) in [0, 1]. Returns (loss, stats dict)."""
         b, n_tokens = clip.shape[0], self.cfg.n_tokens
-        raw_tokens = self.patch_embed(clip)  # (B, n_tokens, dim)
+        raw_tokens = self.patch_norm(self.patch_embed(clip))  # (B, n_tokens, dim)
         tokens = raw_tokens + self.pos_embed
 
         mask = self.masker.sample(b, clip.device)  # (B, n_tokens) bool, True=masked
@@ -288,7 +300,21 @@ class JEPA(nn.Module):
         loss = F.smooth_l1_loss(pred_masked, target_masked.detach())
         stats = {
             "target_std": target_out.detach().std(dim=(0, 1)).mean().item(),
+            "context_std": context_out.detach().std(dim=(0, 1)).mean().item(),
+            # diagnostic for whether output-scale growth is specifically
+            # the final LayerNorm's learnable affine weight (gamma) --
+            # if this tracks target_std/context_std closely, that's the
+            # mechanism, not a genuinely growing pre-norm residual stream.
+            "target_norm_weight": self.target_encoder.norm.weight.detach().mean().item(),
+            "context_norm_weight": self.context_encoder.norm.weight.detach().mean().item(),
             "n_masked": mask[0].sum().item(),
             "n_visible": (~mask[0]).sum().item(),
         }
         return loss, stats
+
+
+def ema_momentum_schedule(step: int, total_steps: int, start: float, end: float) -> float:
+    """Linear ramp start -> end over training, V-JEPA-style -- see
+    JepaConfig.ema_momentum_start/_end."""
+    progress = step / max(1, total_steps - 1)
+    return start + (end - start) * min(1.0, progress)

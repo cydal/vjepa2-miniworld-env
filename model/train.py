@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model.dataset import ClipDataset
-from model.jepa import JEPA, JepaConfig
+from model.jepa import JEPA, JepaConfig, ema_momentum_schedule
 
 
 def cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> float:
@@ -26,18 +26,23 @@ def cosine_warmup_lr(step: int, total_steps: int, warmup_steps: int, base_lr: fl
     return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+DIAG_KEYS = ("target_std", "context_std", "target_norm_weight", "context_norm_weight")
+
+
 def evaluate(model, loader, device):
     model.eval()
-    total_loss, total_std, n = 0.0, 0.0, 0
+    total_loss, totals, n = 0.0, {k: 0.0 for k in DIAG_KEYS}, 0
     with torch.no_grad():
         for clip, _ in loader:
             clip = clip.to(device)
             loss, stats = model(clip)
             total_loss += loss.item()
-            total_std += stats["target_std"]
+            for k in DIAG_KEYS:
+                totals[k] += stats[k]
             n += 1
     model.train()
-    return total_loss / max(1, n), total_std / max(1, n)
+    n = max(1, n)
+    return total_loss / n, {k: v / n for k, v in totals.items()}
 
 
 def main():
@@ -52,6 +57,9 @@ def main():
     parser.add_argument("--num-workers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--mask-ratio", type=float, default=None)
+    parser.add_argument("--ema-momentum-start", type=float, default=None)
+    parser.add_argument("--ema-momentum-end", type=float, default=None)
     args = parser.parse_args()
 
     data_dir = Path(__file__).resolve().parent.parent / args.data_dir
@@ -91,7 +99,15 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, drop_last=True, **loader_kwargs)
 
-    cfg = JepaConfig(clip_len=args.clip_len)
+    cfg_overrides = {}
+    if args.mask_ratio is not None:
+        cfg_overrides["mask_ratio"] = args.mask_ratio
+    if args.ema_momentum_start is not None:
+        cfg_overrides["ema_momentum_start"] = args.ema_momentum_start
+    if args.ema_momentum_end is not None:
+        cfg_overrides["ema_momentum_end"] = args.ema_momentum_end
+    cfg = JepaConfig(clip_len=args.clip_len, **cfg_overrides)
+    print(f"mask_ratio={cfg.mask_ratio} ema_momentum={cfg.ema_momentum_start}->{cfg.ema_momentum_end}")
     model = JEPA(cfg).to(device)
     n_params = sum(p.numel() for p in model.context_encoder.parameters())
     print(f"context encoder params: {n_params / 1e6:.2f}M")
@@ -107,43 +123,51 @@ def main():
     with open(log_path, "w") as log_f:
         for epoch in range(args.epochs):
             t0 = time.time()
-            epoch_loss, epoch_std = 0.0, 0.0
+            epoch_loss, epoch_totals = 0.0, {k: 0.0 for k in DIAG_KEYS}
             for clip, _ in train_loader:
                 clip = clip.to(device)
                 lr = cosine_warmup_lr(step, total_steps, warmup_steps, args.lr)
                 for g in opt.param_groups:
                     g["lr"] = lr
+                momentum = ema_momentum_schedule(
+                    step, total_steps, cfg.ema_momentum_start, cfg.ema_momentum_end
+                )
 
                 loss, stats = model(clip)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
-                model.update_target_encoder()
+                model.update_target_encoder(momentum=momentum)
 
                 epoch_loss += loss.item()
-                epoch_std += stats["target_std"]
+                for k in DIAG_KEYS:
+                    epoch_totals[k] += stats[k]
                 step += 1
 
             n_batches = max(1, len(train_loader))
             train_loss = epoch_loss / n_batches
-            train_std = epoch_std / n_batches
-            val_loss, val_std = evaluate(model, val_loader, device)
+            train_diag = {k: v / n_batches for k, v in epoch_totals.items()}
+            val_loss, val_diag = evaluate(model, val_loader, device)
 
             row = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "train_target_std": train_std,
-                "val_target_std": val_std,
+                **{f"train_{k}": v for k, v in train_diag.items()},
+                **{f"val_{k}": v for k, v in val_diag.items()},
                 "lr": lr,
+                "momentum": momentum,
                 "elapsed_s": time.time() - t0,
             }
             log_f.write(json.dumps(row) + "\n")
             log_f.flush()
             print(
                 f"epoch {epoch:03d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-                f"train_std={train_std:.4f} val_std={val_std:.4f} lr={lr:.2e} "
-                f"({row['elapsed_s']:.1f}s)"
+                f"train_std={train_diag['target_std']:.4f} val_std={val_diag['target_std']:.4f} "
+                f"ctx_std={train_diag['context_std']:.4f} "
+                f"tgt_norm_w={train_diag['target_norm_weight']:.4f} "
+                f"ctx_norm_w={train_diag['context_norm_weight']:.4f} "
+                f"lr={lr:.2e} m={momentum:.5f} ({row['elapsed_s']:.1f}s)"
             )
 
             if val_loss < best_val_loss:
