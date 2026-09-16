@@ -61,12 +61,21 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
 
-    train_ds = ClipDataset(data_dir, clip_len=args.clip_len, stride=args.stride, split="train")
-    val_ds = ClipDataset(data_dir, clip_len=args.clip_len, stride=args.stride, split="val")
+    train_ds = ClipDataset(
+        data_dir, clip_len=args.clip_len, stride=args.stride, split="train", shuffle=True
+    )
+    val_ds = ClipDataset(
+        data_dir, clip_len=args.clip_len, stride=args.stride, split="val", shuffle=False
+    )
     print(f"train clips: {len(train_ds)}, val clips: {len(val_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    # shuffling happens inside ClipDataset (block shuffle over episode
+    # chunks, to keep peak memory bounded) -- DataLoader must not be asked
+    # to shuffle an IterableDataset itself. num_workers>0 parallelizes mp4
+    # decode (the actual bottleneck at this corpus size) across this box's
+    # 4 CPU cores instead of decoding single-threaded.
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, drop_last=True, num_workers=3)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, drop_last=True, num_workers=2)
 
     cfg = JepaConfig(clip_len=args.clip_len)
     model = JEPA(cfg).to(device)

@@ -142,3 +142,51 @@ genuine, not-yet-resolved open question -- not a pipeline bug (the
 pipeline itself -- data loading, masking, EMA, no-collapse -- is verified
 working). Recorded honestly rather than as a pass; see README's "Phase 2
 pilot-scale run" section for the same numbers.
+
+## Scale-up to 5,000 episodes (2026-09-16)
+
+Regenerated a 10x larger corpus (`dataset/scale5k/`, 5000 episodes,
+199.9MB, seeds 1000-5999 so no overlap with the 500-episode pilot's seeds
+0-499) with `scripts/generate_pilot.py` -- dynamics stats matched the
+pilot closely (83% door-open, 97% key pickup, 100% moving obstacles, 52%
+goal-reached, 93% blocked-move), confirming quality held at 10x scale.
+
+**Hit a real memory ceiling first.** `model/dataset.py`'s original
+`ClipDataset` decoded the entire corpus into RAM at construction (fine at
+pilot scale, ~1.9GB) -- at 5000 episodes that's ~19GB decoded, and this box
+only has 15GB total RAM. Caught it mid-run (RSS climbing past 8GB and
+still growing, no swap configured) and killed the job before it got
+OOM-killed uncontrolled. Rewrote `ClipDataset` as an `IterableDataset` that
+decodes in shuffled chunks of `chunk_size` episodes (block shuffle, not a
+global shuffle) and drops each chunk's frames before moving to the next --
+peak memory now stays bounded regardless of corpus size, verified via
+`free -h` during a run (stayed ~5-6GB used throughout, vs. climbing
+unbounded before). This also made per-epoch mp4 decoding a recurring cost
+instead of a one-time cost, so added `num_workers=3` to the `DataLoader`
+calls in `train.py`/`probe.py` to parallelize decode across this box's 4
+CPU cores -- confirmed via a pilot-scale dry run that this brought epoch
+time back down to the original in-RAM speed (49.5s), i.e. decode is fully
+hidden behind GPU compute at this batch size.
+
+**Training** (15 epochs, batch 32, lr=1e-4 peak, 36533 train / 4137 val
+clips, same 2.67M-param encoder, ~550s/epoch -> ~2.3hr total): the same
+drift pattern as the pilot runs, now milder and it recovers by the end --
+val_loss dropped to 0.0421 by epoch 1, drifted up to 0.0618 by epoch 3,
+then declined smoothly as the cosine schedule decayed lr, finishing at
+0.0412 (epoch 14, the best of the run). `target_std` again only grew
+(0.41 -> 0.85, plateauing in the second half) -- no collapse, and this
+growth pattern now looks like a structural property of this EMA/smooth-L1
+setup rather than an artifact of one bad lr choice, since it showed up
+again even at the lower lr and 10x the data. Not investigated further this
+round -- flagged as a real open item if scaling further.
+
+Linear probe on `checkpoint_best.pt` (epoch 14): **trained encoder MSE
+1.08 vs. random-init 0.55 -- trained still worse, but the gap closed
+substantially**: 20x worse at 500 episodes (run 1, before the lr fix),
+3.5x worse at 500 episodes (run 2, after the lr fix), **2x worse at 5,000
+episodes**. The gap shrinking monotonically as data scales up is itself
+the signal worth acting on -- it suggests data volume is a real factor,
+not just a red herring, even though this run alone still doesn't clear the
+bar this plan set. Doesn't yet distinguish between "needs more data" and
+"needs more training/bigger model at this data size" as the dominant
+lever -- both remain plausible.

@@ -83,10 +83,32 @@ dominates: scale, mean-pooling diluting local signal, or the objective
 favoring scene appearance over agent state) are in
 [docs/phase2-plan.md](docs/phase2-plan.md)'s Results section.
 
+## Scale-up to 5,000 episodes (2026-09-16)
+
+Regenerated a 10x larger corpus (`dataset/scale5k/`, dynamics stats
+matched the pilot) and retrained the same model on it. Along the way,
+`model/dataset.py` needed a real fix -- it decoded the whole corpus into
+RAM, which fit at pilot scale (~1.9GB) but not at 5000 episodes (~19GB,
+more than this box's 15GB total RAM); rewrote it to stream in shuffled
+chunks with bounded memory, and parallelized decode across CPU cores to
+keep it from becoming the bottleneck. See
+[docs/phase2-plan.md](docs/phase2-plan.md) for the full story, including a
+drift pattern in training that now looks structural (shows up regardless
+of lr or data scale) rather than a one-off tuning mistake.
+
+Linear-probe result: **trained encoder MSE 1.08 vs. random-init 0.55 --
+still worse, but the gap closed from 3.5x (500 episodes) to 2x (5,000
+episodes)**. The gap closing as data scales up is itself a real signal,
+even though this run still doesn't clear the bar. Doesn't yet separate
+"needs more data" from "needs more training/bigger model" as the
+dominant lever.
+
 ## Next
 
-Not yet decided: whether to scale up data generation now anyway, first
-retry the probe itself (e.g. attend to the agent-local token instead of
-mean-pooling, or probe from an intermediate layer), or run longer/bigger
-before concluding. Appearance/structural holdout splits and action
-conditioning (V-JEPA-2-AC) remain deliberately deferred past this.
+Not yet decided: keep scaling data (the gap has closed 20x -> 3.5x -> 2x
+across three data points, worth seeing where it goes), fix the probe
+itself (e.g. attend to the agent-local token instead of mean-pooling, or
+probe an intermediate layer), address the training drift pattern directly,
+or hold data fixed and scale training/model size instead. Appearance/
+structural holdout splits and action conditioning (V-JEPA-2-AC) remain
+deliberately deferred past this.

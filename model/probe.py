@@ -59,8 +59,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_dir = Path(__file__).resolve().parent.parent / args.data_dir
 
-    val_ds = ClipDataset(data_dir, clip_len=args.clip_len, stride=args.stride, split="val")
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
+    val_ds = ClipDataset(
+        data_dir, clip_len=args.clip_len, stride=args.stride, split="val", shuffle=False
+    )
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, drop_last=True, num_workers=2)
     print(f"val clips: {len(val_ds)}")
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
