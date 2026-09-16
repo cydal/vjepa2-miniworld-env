@@ -4,3 +4,6 @@ dataset/
 notes/
 runs/
 .ipynb_checkpoints/
+overnight_log.txt
+overnight_stdout.log
+overnight_report.md
