@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--clip-len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

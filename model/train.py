@@ -44,11 +44,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, default="dataset/pilot")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--clip-len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--num-workers", type=int, default=3)
+    parser.add_argument("--chunk-size", type=int, default=64)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     args = parser.parse_args()
 
     data_dir = Path(__file__).resolve().parent.parent / args.data_dir
@@ -62,10 +65,12 @@ def main():
     print(f"device: {device}")
 
     train_ds = ClipDataset(
-        data_dir, clip_len=args.clip_len, stride=args.stride, split="train", shuffle=True
+        data_dir, clip_len=args.clip_len, stride=args.stride, split="train",
+        shuffle=True, chunk_size=args.chunk_size,
     )
     val_ds = ClipDataset(
-        data_dir, clip_len=args.clip_len, stride=args.stride, split="val", shuffle=False
+        data_dir, clip_len=args.clip_len, stride=args.stride, split="val",
+        shuffle=False, chunk_size=args.chunk_size,
     )
     print(f"train clips: {len(train_ds)}, val clips: {len(val_ds)}")
 
@@ -73,9 +78,18 @@ def main():
     # chunks, to keep peak memory bounded) -- DataLoader must not be asked
     # to shuffle an IterableDataset itself. num_workers>0 parallelizes mp4
     # decode (the actual bottleneck at this corpus size) across this box's
-    # 4 CPU cores instead of decoding single-threaded.
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, drop_last=True, num_workers=3)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, drop_last=True, num_workers=2)
+    # 4 CPU cores instead of decoding single-threaded. persistent_workers
+    # avoids re-forking workers every epoch; prefetch_factor keeps several
+    # batches decoded ahead of the GPU so it isn't stalling on I/O -- this
+    # model is tiny (a few MB of activations per batch) so decode, not GPU
+    # compute, is the default bottleneck unless batches are kept flowing.
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+    )
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, drop_last=True, **loader_kwargs)
 
     cfg = JepaConfig(clip_len=args.clip_len)
     model = JEPA(cfg).to(device)

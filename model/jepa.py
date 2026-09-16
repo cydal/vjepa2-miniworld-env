@@ -7,6 +7,7 @@ action conditioning here -- that's a later phase (see docs/phase2-plan.md).
 import copy
 import math
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -175,6 +176,24 @@ class MultiBlockMask:
         return masks.reshape(batch_size, t * g * g)
 
 
+def split_mask_indices(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """mask: (B, N) bool, True = masked. Every row has the same masked count
+    (enforced by MultiBlockMask), so a single stable argsort per row puts
+    all visible (False) indices first and masked (True) indices last, in
+    original order within each group -- giving fully vectorized visible/
+    masked index tensors with no per-sample Python loop.
+    Returns (visible_idx, masked_idx), each (B, n_visible)/(B, n_masked).
+    """
+    order = torch.argsort(mask.to(torch.int64), dim=1, stable=True)
+    n_visible = int((~mask[0]).sum().item())
+    return order[:, :n_visible], order[:, n_visible:]
+
+
+def batched_gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """x: (B, N, D), idx: (B, K) -> (B, K, D)."""
+    return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+
 class Predictor(nn.Module):
     """Takes context-encoder tokens at visible positions + mask tokens (with
     positional embeddings) at masked positions, self-attends, and outputs a
@@ -194,28 +213,29 @@ class Predictor(nn.Module):
         self.register_buffer("pos_embed", pos.unsqueeze(0))  # (1, n_tokens, dim)
 
     def forward(
-        self, context_tokens: torch.Tensor, mask: torch.Tensor
+        self,
+        context_tokens: torch.Tensor,
+        visible_idx: torch.Tensor,
+        masked_idx: torch.Tensor,
+        n_tokens: int,
     ) -> torch.Tensor:
         """context_tokens: (B, n_visible, encoder_dim) tokens the encoder
-        produced for visible positions only, already ordered by their
-        original position among the visible set.
-        mask: (B, n_tokens) bool, True = masked.
-        Returns predictions for the masked positions: (B, n_masked, encoder_dim).
+        produced for visible positions only, ordered to match visible_idx.
+        visible_idx/masked_idx: (B, n_visible)/(B, n_masked), from
+        split_mask_indices. Returns predictions for the masked positions:
+        (B, n_masked, encoder_dim).
         """
-        b, n_tokens = mask.shape
+        b = context_tokens.shape[0]
         d = self.cfg.predictor_dim
-        full = torch.zeros(b, n_tokens, d, device=mask.device, dtype=context_tokens.dtype)
         ctx_proj = self.in_proj(context_tokens)
-        for i in range(b):
-            vis_idx = (~mask[i]).nonzero(as_tuple=True)[0]
-            full[i, vis_idx] = ctx_proj[i, : vis_idx.numel()]
-            masked_idx = mask[i].nonzero(as_tuple=True)[0]
-            full[i, masked_idx] = self.mask_token.squeeze(0)
+        full = torch.zeros(b, n_tokens, d, device=context_tokens.device, dtype=context_tokens.dtype)
+        full.scatter_(1, visible_idx.unsqueeze(-1).expand(-1, -1, d), ctx_proj)
+        mask_tokens = self.mask_token.expand(b, masked_idx.shape[1], d)
+        full.scatter_(1, masked_idx.unsqueeze(-1).expand(-1, -1, d), mask_tokens)
         full = full + self.pos_embed
         out = self.transformer(full)
         out = self.out_proj(out)
-        preds = [out[i, mask[i]] for i in range(b)]
-        return torch.stack(preds, dim=0)
+        return batched_gather(out, masked_idx)
 
 
 class JEPA(nn.Module):
@@ -241,38 +261,29 @@ class JEPA(nn.Module):
             tp.mul_(m).add_(cp, alpha=1 - m)
 
     def encode_context(
-        self, tokens: torch.Tensor, mask: torch.Tensor
+        self, tokens: torch.Tensor, visible_idx: torch.Tensor
     ) -> torch.Tensor:
         """tokens: (B, n_tokens, dim) with pos_embed already added.
-        Returns encoder output for visible tokens only, one tensor per batch
-        row concatenated to the max visible count (assumes same mask ratio
-        so counts match across the batch, true for MultiBlockMask)."""
-        b = tokens.shape[0]
-        n_visible = (~mask[0]).sum().item()
-        visible = torch.zeros(
-            b, n_visible, tokens.shape[-1], device=tokens.device, dtype=tokens.dtype
-        )
-        for i in range(b):
-            vis_idx = (~mask[i]).nonzero(as_tuple=True)[0]
-            visible[i] = tokens[i, vis_idx]
+        visible_idx: (B, n_visible), from split_mask_indices. Returns
+        encoder output for visible tokens only."""
+        visible = batched_gather(tokens, visible_idx)
         return self.context_encoder(visible)
 
     def forward(self, clip: torch.Tensor):
         """clip: (B, T, C, H, W) in [0, 1]. Returns (loss, stats dict)."""
-        b = clip.shape[0]
+        b, n_tokens = clip.shape[0], self.cfg.n_tokens
         raw_tokens = self.patch_embed(clip)  # (B, n_tokens, dim)
         tokens = raw_tokens + self.pos_embed
 
         mask = self.masker.sample(b, clip.device)  # (B, n_tokens) bool, True=masked
+        visible_idx, masked_idx = split_mask_indices(mask)
 
         with torch.no_grad():
             target_out = self.target_encoder(tokens)  # (B, n_tokens, dim)
-            target_masked = torch.stack(
-                [target_out[i, mask[i]] for i in range(b)], dim=0
-            )
+            target_masked = batched_gather(target_out, masked_idx)
 
-        context_out = self.encode_context(tokens, mask)  # (B, n_visible, dim)
-        pred_masked = self.predictor(context_out, mask)  # (B, n_masked, dim)
+        context_out = self.encode_context(tokens, visible_idx)  # (B, n_visible, dim)
+        pred_masked = self.predictor(context_out, visible_idx, masked_idx, n_tokens)
 
         loss = F.smooth_l1_loss(pred_masked, target_masked.detach())
         stats = {
