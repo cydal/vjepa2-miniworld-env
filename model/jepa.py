@@ -29,9 +29,10 @@ class JepaConfig:
     predictor_heads: int = 4
     mlp_ratio: float = 4.0
     mask_ratio: float = 0.9
-    # EMA momentum ramps start -> end over training (V-JEPA-style schedule)
+    # EMA momentum ramps start -> end over training -- matches V-JEPA1's
+    # actual pretrain config (configs/pretrain/vitl16.yaml: ema: [0.998, 1.0])
     # rather than staying fixed -- see update_target_encoder().
-    ema_momentum_start: float = 0.996
+    ema_momentum_start: float = 0.998
     ema_momentum_end: float = 1.0
 
     @property
@@ -292,12 +293,21 @@ class JEPA(nn.Module):
 
         with torch.no_grad():
             target_out = self.target_encoder(tokens)  # (B, n_tokens, dim)
+            # V-JEPA1/2 both apply a non-affine LayerNorm to the target
+            # output right before the loss (app/vjepa/train.py) -- this
+            # pins per-token scale to unit variance regardless of what the
+            # encoder's own (affine) final LayerNorm lets drift. This is
+            # what actually fixes unbounded target_std growth, not
+            # normalizing the input (patch_norm alone wasn't enough at
+            # scale -- see docs/phase2-plan.md).
+            target_out = F.layer_norm(target_out, (target_out.shape[-1],))
             target_masked = batched_gather(target_out, masked_idx)
 
         context_out = self.encode_context(tokens, visible_idx)  # (B, n_visible, dim)
         pred_masked = self.predictor(context_out, visible_idx, masked_idx, n_tokens)
 
-        loss = F.smooth_l1_loss(pred_masked, target_masked.detach())
+        # V-JEPA1/2 use plain L1 (loss_exp=1.0), not smooth-L1.
+        loss = F.l1_loss(pred_masked, target_masked.detach())
         stats = {
             "target_std": target_out.detach().std(dim=(0, 1)).mean().item(),
             "context_std": context_out.detach().std(dim=(0, 1)).mean().item(),

@@ -258,3 +258,72 @@ Not yet done: rerunning the probe (agent-position linear regression) with
 this fixed model at the 5,000/10,000-episode scale already generated, to
 see whether the healthier training dynamics also finally clear the
 probe-vs-random-init bar that no run had cleared before this fix.
+
+## Overnight run: gate failed, correctly stopped before scaling (2026-09-17)
+
+`scripts/overnight_run.py` (retrain on scale10k with the patch_norm fix ->
+probe gate -> if passed, 50k episodes + longer training) ran unattended
+overnight. Step 1 retrain reached a new best val_loss of 0.0138 (far below
+any prior run) at epoch 3, then drifted to 0.1198 by epoch 11 -- same
+drift *shape* as before, just with a much lower floor first. The probe
+gate on that best (epoch-3) checkpoint still failed: trained MSE 0.9384 vs
+random-init 0.5901. Per the script's design, it stopped there rather than
+spending the ~12hr data-gen+training budget on a foundation that still
+wasn't clearing the bar. Correct, safe behavior.
+
+## Compared against the actual V-JEPA1/V-JEPA2 codebases (2026-09-17)
+
+Cloned `facebookresearch/jepa` and `facebookresearch/vjepa2` and read
+`app/vjepa/train.py` + `configs/pretrain/vitl16.yaml` directly instead of
+reasoning from memory of the paper. Found several concrete gaps:
+
+- **Target-side normalization (the real fix, not `patch_norm`):** both
+  versions apply a non-affine `F.layer_norm(h, (h.size(-1),))` directly to
+  the target encoder's output, right before the loss. This pins per-token
+  scale to unit variance regardless of what the encoder's own (affine)
+  final LayerNorm lets drift -- more direct than normalizing the *input*
+  (`patch_norm`), which fixed pilot scale but not 10k-episode scale.
+- **EMA momentum**: v1's actual pretrain config uses `[0.998, 1.0]` (I had
+  guessed `[0.996, 1.0]` -- corrected).
+- **Loss**: plain L1 (`loss_exp: 1.0`), not smooth-L1 -- corrected.
+- **Gradient clipping**: v1 clips encoder/predictor grad norms separately
+  (`clip_grad: 10.0`), only after warmup. Notably **absent from v2's code
+  entirely** -- v2 apparently relies on the target-side normalization (plus
+  bf16, RoPE, and far larger scale) instead. Added anyway as a cheap safety
+  net since it's harmless and V-JEPA1 (the from-scratch pretraining case,
+  closer to our setup than v2's fine-tuning-style configs) uses it.
+- **Masking**: confirmed my "same spatial mask across all temporal
+  tubelets" was actually *right* for their default configs
+  (`temporal_scale: [1.0, 1.0]` means blocks always span the full clip
+  duration) -- I was wrong to describe this as a gap in an earlier
+  message. Real difference: two blended block styles per example (8 small
+  blocks @ 15% spatial scale + 2 large blocks @ 70%), not my single-style
+  ~90% approximation. Not yet adopted.
+
+Implemented the target-side LayerNorm, corrected EMA start, L1 loss, and
+gradient clipping (`model/jepa.py`, `model/train.py`). Verified:
+
+- Pilot scale (10 epochs): monotonic val_loss decrease every epoch
+  (0.695 -> 0.323), `target_std` now tightly bounded (0.37-0.47) the whole
+  run -- consistent with patch_norm's earlier pilot-scale result.
+- **10k-episode scale (the critical test, since patch_norm alone didn't
+  fix this scale): drift is real but far milder.** val_loss: 0.230 -> 0.132
+  -> 0.110 -> **0.1035 (best, epoch 3)** -> 0.107 -> 0.124 -> 0.147 -> 0.163
+  -> 0.174 -> 0.175. Best-to-worst ratio ~1.7x here vs. ~8.7x in the
+  previous (patch_norm-only) 10k run. Real improvement, not fully solved.
+- **Probe on the new best checkpoint (epoch 3) still fails, and slightly
+  worse in relative terms**: trained MSE 1.0341 vs random-init 0.5578
+  (~85% worse) vs. the overnight run's 0.9384 vs 0.5901 (~59% worse).
+
+**This is the important finding: training got measurably more stable and
+more faithful to the published recipe, but the probe result did not
+improve.** That decouples "training instability" from "probe failure" --
+they are not the same problem. The remaining gap is more likely: (a) probe
+methodology (mean-pooling over all 512 tokens dilutes whatever
+agent-position signal exists in a token local to the agent), (b) task
+design (masked-frame prediction mostly rewards learning static
+scene/appearance -- most masked tokens are background, not the small
+agent region), or (c) scale (2.67M params / 10k episodes vs. V-JEPA's
+80M-600M+ params on internet-scale video is a 30-300x+ gap, independent of
+recipe fidelity). Not yet resolved -- this needs a person's judgment on
+which to chase next, not more unattended scaling.

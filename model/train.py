@@ -60,6 +60,7 @@ def main():
     parser.add_argument("--mask-ratio", type=float, default=None)
     parser.add_argument("--ema-momentum-start", type=float, default=None)
     parser.add_argument("--ema-momentum-end", type=float, default=None)
+    parser.add_argument("--clip-grad", type=float, default=10.0)
     args = parser.parse_args()
 
     data_dir = Path(__file__).resolve().parent.parent / args.data_dir
@@ -107,7 +108,7 @@ def main():
     if args.ema_momentum_end is not None:
         cfg_overrides["ema_momentum_end"] = args.ema_momentum_end
     cfg = JepaConfig(clip_len=args.clip_len, **cfg_overrides)
-    print(f"mask_ratio={cfg.mask_ratio} ema_momentum={cfg.ema_momentum_start}->{cfg.ema_momentum_end}")
+    print(f"mask_ratio={cfg.mask_ratio} ema_momentum={cfg.ema_momentum_start}->{cfg.ema_momentum_end} clip_grad={args.clip_grad}")
     model = JEPA(cfg).to(device)
     n_params = sum(p.numel() for p in model.context_encoder.parameters())
     print(f"context encoder params: {n_params / 1e6:.2f}M")
@@ -136,6 +137,14 @@ def main():
                 loss, stats = model(clip)
                 opt.zero_grad()
                 loss.backward()
+                # V-JEPA1 clips encoder/predictor grad norms separately,
+                # only after warmup (app/vjepa/train.py) -- cheap safety
+                # net against gradient spikes; dropped in V-JEPA2 (which
+                # relies on the target-side LayerNorm instead) but harmless
+                # to keep here too.
+                if step >= warmup_steps and args.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(model.context_encoder.parameters(), args.clip_grad)
+                    torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), args.clip_grad)
                 opt.step()
                 model.update_target_encoder(momentum=momentum)
 
