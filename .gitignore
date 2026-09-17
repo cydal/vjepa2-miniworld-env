@@ -7,3 +7,4 @@ runs/
 overnight_log.txt
 overnight_stdout.log
 overnight_report.md
+*_stdout.log

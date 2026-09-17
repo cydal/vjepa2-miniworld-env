@@ -73,14 +73,21 @@ def build_encoder(img_size: int, num_frames: int, pretrained: bool):
 
 
 @torch.no_grad()
-def embed_all_tokens_pretrained(encoder, loader, device):
-    feats, targets = [], []
+def embed_all_tokens_pretrained(encoder, loader, device, max_clips: int):
+    """ViT-B's embed_dim (768) is 4x our own model's (192) -- caching full
+    per-token embeddings for all ~8k val clips needs ~12.5GB and OOM-kills
+    this 15GB-RAM box. Cap the clip count instead; a few thousand clips is
+    plenty for a probe comparison."""
+    feats, targets, n = [], [], 0
     for clip, agent_position in loader:
         clip = clip.to(device)  # (B, T, C, H, W)
         clip = clip.permute(0, 2, 1, 3, 4)  # -> (B, C, T, H, W), their expected layout
         out = encoder(clip)  # (B, N, D)
         feats.append(out.cpu())
         targets.append(agent_position)
+        n += clip.shape[0]
+        if n >= max_clips:
+            break
     return torch.cat(feats, dim=0), torch.cat(targets, dim=0)
 
 
@@ -91,6 +98,7 @@ def main():
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--probe-steps", type=int, default=500)
+    parser.add_argument("--max-clips", type=int, default=2000)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,7 +113,7 @@ def main():
     for name, pretrained in [("vjepa2_pretrained", True), ("vjepa2_random_init", False)]:
         encoder = build_encoder(img_size=128, num_frames=args.clip_len, pretrained=pretrained).to(device)
         encoder.eval()
-        feats, targets = embed_all_tokens_pretrained(encoder, val_loader, device)
+        feats, targets = embed_all_tokens_pretrained(encoder, val_loader, device, args.max_clips)
         mse = train_and_eval_attentive_probe(feats, targets, device, steps=args.probe_steps)
         print(f"{name}: attentive-probe MSE on agent_position = {mse:.4f} (tokens {feats.shape[1]}, dim {feats.shape[2]})")
         del encoder

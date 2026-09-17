@@ -327,3 +327,76 @@ agent region), or (c) scale (2.67M params / 10k episodes vs. V-JEPA's
 80M-600M+ params on internet-scale video is a 30-300x+ gap, independent of
 recipe fidelity). Not yet resolved -- this needs a person's judgment on
 which to chase next, not more unattended scaling.
+
+## Attentive-pooling probe and pretrained-V-JEPA2 control (2026-09-17)
+
+Two experiments to disambiguate (a)/(b)/(c) above, both cheap (no
+retraining of our from-scratch model needed):
+
+**model/attentive_probe.py** -- V-JEPA's actual eval code
+(`src/models/attentive_pooler.py`) doesn't mean-pool; it uses a learned
+query token that cross-attends over all encoder output tokens, then a
+linear head. Ran this against our best from-scratch checkpoint: trained
+MSE 0.0378 vs random-init 0.0167 -- still worse, ruling out mean-pooling
+as the (sole) explanation. Even a probe that can attend anywhere can't
+recover the signal.
+
+**model/pretrained_probe.py** -- zero-shot control: Meta's real pretrained
+V-JEPA2.1 ViT-B/16 checkpoint (80M params, natural video, downloaded from
+their public release), no fine-tuning, same attentive probe, on our
+domain. Runs natively at our 128px/16-frame clip shape via RoPE (0
+missing/unexpected keys on load -- resolution/frame-count-independent
+weights). Result: **trained MSE 0.5622 vs random-init 1.3091 -- pretrained
+beats random-init by ~2.3x**, the opposite direction from our from-scratch
+model. This decisively points to (c) scale: a properly-pretrained JEPA
+encoder retains generically useful signal even zero-shot on this
+out-of-domain synthetic environment; our 2.67M-param/10k-episode encoder
+does not, meaning it's not that this task is fundamentally impossible to
+learn via masked-video prediction -- our from-scratch setup is
+undertrained. (Needed a `--max-clips` cap in the embedding-extraction
+loop -- ViT-B's embed_dim (768) is 4x ours, so caching all ~8k val clips'
+per-token embeddings would need ~12.5GB and OOM-kills this 15GB box; capped
+at 2000 clips.)
+
+## Fine-tuning the pretrained encoder (2026-09-17)
+
+Given the control experiment's result, fine-tuning the pretrained encoder
+on our domain is the well-motivated path forward (cheaper than out-scaling
+an 80M-param pretrained model with a from-scratch one, and still real JEPA
+work -- this is literally what V-JEPA-2-AC's post-training does).
+
+`model/pretrained_jepa.py`: `PretrainedJEPA`, same `forward()`/
+`update_target_encoder()` interface as `model.jepa.JEPA` so it drops into
+a training loop unchanged -- swaps in the real V-JEPA2.1 `VisionTransformer`
+(RoPE) as both context and target encoder (EMA-linked as usual), reuses
+our existing masking (`MultiBlockMask`/`split_mask_indices`, same token
+grid shape) and their native mask support (`apply_masks`, works directly
+with our visible-token index tensors) and our existing small
+from-scratch `Predictor`. `model/finetune.py` mirrors `train.py`'s loop
+with fine-tuning-appropriate defaults.
+
+**First smaller test** (pilot, 500 episodes, 10 epochs, batch 32, single
+lr=2e-5 for everything): loss improved for ~4 epochs then drifted
+(0.477 -> 0.327 best at epoch 3 -> 0.365 final). Attentive-probe result:
+**worse than the zero-shot baseline** (0.95 on pilot_val, 1.03 on
+scale10k_val vs. 0.56 zero-shot) -- fine-tuning on this little data with a
+single shared lr let the from-scratch predictor's noisy early gradients
+push the 80M-param pretrained encoder somewhere worse, a standard
+catastrophic-forgetting failure mode.
+
+**Fix: split learning rates** -- encoder lr = 0.05x the predictor's lr
+(1e-6 vs 2e-5 in this test), via two AdamW param groups sharing the same
+warmup/cosine schedule shape. Re-ran the identical smaller test: loss
+now decreases monotonically for all 10 epochs (0.475 -> 0.291, no drift).
+**Attentive-probe result on the more reliable held-out set (scale10k_val,
+2000 clips): MSE 0.1876 -- a 3x improvement over the zero-shot pretrained
+baseline (0.5622), 7x better than random-init (1.3091).** (pilot_val's own
+419-clip val split gave a noisier 0.8446 -- too little held-out data for a
+reliable read; scale10k_val is the trustworthy number here.)
+
+This smaller test validates the fine-tuning recipe (LR split) and gives a
+clear positive signal before committing to a longer run. Decision: run
+the full fine-tune on the *already-generated* `dataset/scale10k` (no new
+data generation needed yet -- decide whether more is warranted based on
+this run's result) with the same recipe, more epochs given 10k has far
+less overfitting risk than pilot's 500 episodes.
