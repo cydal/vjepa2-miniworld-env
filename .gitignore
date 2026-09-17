@@ -8,3 +8,4 @@ overnight_log.txt
 overnight_stdout.log
 overnight_report.md
 *_stdout.log
+carnav_gen_shard*.log
