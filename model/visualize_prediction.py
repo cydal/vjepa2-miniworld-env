@@ -44,7 +44,8 @@ def last_tubelet_mask(batch_size: int, cfg: JepaConfig, device) -> torch.Tensor:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--jepa-checkpoint", type=str, required=True)
+    parser.add_argument("--jepa-checkpoint", type=str, default=None,
+                         help="fine-tuned PretrainedJEPA checkpoint; omit to use the zero-shot pretrained encoder as-is")
     parser.add_argument("--decoder-checkpoint", type=str, required=True)
     parser.add_argument("--clip-len", type=int, default=16)
     parser.add_argument("--stride", type=int, default=8)

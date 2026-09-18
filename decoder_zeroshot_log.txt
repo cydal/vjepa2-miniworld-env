@@ -1,0 +1,11 @@
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+train clips: 52380, val clips: 5790
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/contextlib.py:105: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+epoch 000 train_loss=0.00326 val_loss=0.00229 (2122.4s)
+epoch 001 train_loss=0.00203 val_loss=0.00201 (2160.1s)
+epoch 002 train_loss=0.00185 val_loss=0.00185 (2148.0s)
+epoch 003 train_loss=0.00169 val_loss=0.00178 (2153.4s)
+epoch 004 train_loss=0.00158 val_loss=0.00172 (2146.5s)
+best val_loss=0.00172, saved to runs/decoder_zeroshot/decoder_best.pt

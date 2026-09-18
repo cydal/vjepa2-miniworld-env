@@ -29,7 +29,8 @@ from model.pretrained_jepa import PretrainedJEPA
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--encoder-checkpoint", type=str, required=True)
+    parser.add_argument("--encoder-checkpoint", type=str, default=None,
+                         help="fine-tuned PretrainedJEPA checkpoint; omit to use the zero-shot pretrained encoder as-is")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -46,9 +47,10 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = JepaConfig()
-    jepa = PretrainedJEPA(cfg).to(device)
-    ckpt = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
-    jepa.load_state_dict(ckpt["model"])
+    jepa = PretrainedJEPA(cfg).to(device)  # already loads Meta's pretrained weights
+    if args.encoder_checkpoint:
+        ckpt = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
+        jepa.load_state_dict(ckpt["model"])
     encoder = jepa.context_encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)

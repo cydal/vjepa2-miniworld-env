@@ -56,10 +56,14 @@ def main():
     finetuned.load_state_dict(ckpt["model"])
     finetuned.eval()
 
-    random_init = PretrainedJEPA(cfg).to(device)
-    random_init.eval()
+    # NOTE: PretrainedJEPA.__init__ always loads Meta's pretrained weights
+    # (there's no random-init path in that class) -- this is a second
+    # zero-shot-pretrained measurement, NOT a true random-init baseline.
+    # Use model/pretrained_probe.py for a real random-init comparison.
+    zero_shot = PretrainedJEPA(cfg).to(device)
+    zero_shot.eval()
 
-    for name, model in [("finetuned", finetuned), ("random_init", random_init)]:
+    for name, model in [("finetuned", finetuned), ("zero_shot_pretrained", zero_shot)]:
         feats, targets = embed_all_tokens(model.context_encoder, val_loader, device, args.max_clips)
         mse = train_and_eval_attentive_probe(feats, targets, device, steps=args.probe_steps)
         print(f"{name}: attentive-probe MSE on agent_position = {mse:.4f} (tokens {feats.shape[1]}, dim {feats.shape[2]})")

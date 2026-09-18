@@ -1,0 +1,14 @@
+device: cuda
+train clips: 52380, val clips: 5790
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+context encoder params: 86.8M (pretrained V-JEPA2.1 ViT-B/16)
+encoder_lr=0.00e+00 predictor_lr=2.00e-05
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/contextlib.py:105: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+epoch 000 train_loss=0.4406 val_loss=0.3833 train_std=0.4805 val_std=0.4741 lr=1.68e-05 m=0.99867 (2798.5s)
+epoch 001 train_loss=0.3749 val_loss=0.3679 train_std=0.4766 val_std=0.4741 lr=5.91e-06 m=0.99934 (2791.0s)
+epoch 002 train_loss=0.3647 val_loss=0.3652 train_std=0.4743 val_std=0.4741 lr=6.47e-10 m=1.00000 (2793.1s)
+saved final checkpoint to runs/predictor_only_zeroshot/checkpoint_final.pt
+saved best checkpoint (val_loss=0.3652) to runs/predictor_only_zeroshot/checkpoint_best.pt
+run dir: runs/predictor_only_zeroshot

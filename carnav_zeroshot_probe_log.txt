@@ -1,0 +1,8 @@
+val clips: 5790
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+loaded pretrained weights: 0 missing, 0 unexpected keys
+/home/ubuntu/miniconda3/envs/jepa/lib/python3.11/contextlib.py:105: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+vjepa2_pretrained: attentive-probe MSE on agent_position = 2912.5024 (tokens 512, dim 768)
+vjepa2_random_init: attentive-probe MSE on agent_position = 3742.8408 (tokens 512, dim 768)
