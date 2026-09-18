@@ -11,3 +11,7 @@ overnight_report.md
 carnav_gen_shard*.log
 overnight_carnav_log.txt
 overnight_carnav_report.md
+demo_realvideo*log.txt
+carnav_zeroshot_probe_log.txt
+decoder_zeroshot_log.txt
+predictor_only_zeroshot_log.txt
